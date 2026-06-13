@@ -1,42 +1,36 @@
 """
 =====================================================================
   Pengumpulan Data Lowongan Kerja - Web Scraping
-  Target Platform : Glints, JobStreet, LinkedIn
+  Target Platform : LinkedIn (public), Glints, JobStreet
   Target Roles    : UI/UX Designer, Data Analyst, Fullstack Developer
   Output          : raw_dataset_lowongan.csv  &  raw_dataset_lowongan.json
-  Metode          : BeautifulSoup (requests) + Selenium (dynamic page)
+  Metode          : Selenium (headless Chrome)
 =====================================================================
 """
 
 import time
-import json
 import logging
 import re
 from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 try:
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
     from webdriver_manager.chrome import ChromeDriverManager
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import (
-        TimeoutException, NoSuchElementException, WebDriverException
-    )
-    SELENIUM_AVAILABLE = True
+    USE_WDM = True
 except ImportError:
-    SELENIUM_AVAILABLE = False
-    logging.warning("Selenium tidak terinstall. Hanya BeautifulSoup yang digunakan.")
+    USE_WDM = False
 
+# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -44,435 +38,473 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── Konfigurasi ──────────────────────────────────────────────────────────────
 TARGET_ROLES = ["UI/UX Designer", "Data Analyst", "Fullstack Developer"]
 
-OUTPUT_DIR  = Path(".")
-OUTPUT_CSV  = OUTPUT_DIR / "raw_dataset_lowongan.csv"
-OUTPUT_JSON = OUTPUT_DIR / "raw_dataset_lowongan.json"
+OUTPUT_CSV  = Path("raw_dataset_lowongan.csv")
+OUTPUT_JSON = Path("raw_dataset_lowongan.json")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-}
-
-# Kolom target raw dataset
 COLUMNS = [
-    "job_title",
-    "company_name",
-    "location",
-    "job_type",           # Full-time / Part-time / Remote / Contract
-    "experience_level",
-    "education_req",
-    "salary_range",
-    "job_requirements",   # Skills / tools
-    "responsibilities",
-    "posted_date",
-    "scraped_date",
-    "source_platform",
-    "job_url",
+    "job_title", "company_name", "location", "job_type",
+    "experience_level", "education_req", "salary_range",
+    "job_requirements", "responsibilities",
+    "posted_date", "scraped_date", "source_platform", "job_url",
 ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  HELPER: Selenium driver
+#  SELENIUM DRIVER
 # ═══════════════════════════════════════════════════════════════════════════
-def build_selenium_driver():
+
+def build_driver():
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=options
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--lang=id-ID")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     )
+    # Sembunyikan tanda automation
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    if USE_WDM:
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()), options=options
+        )
+    else:
+        driver = webdriver.Chrome(options=options)
+
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
 
 
-def selenium_get(driver, url: str, wait_selector: str, timeout: int = 15) -> BeautifulSoup | None:
-    """Buka URL dengan Selenium lalu kembalikan BeautifulSoup dari page source."""
+def wait_and_get(driver, url, css_selector, timeout=20):
+    """Buka URL dan tunggu sampai elemen muncul."""
     try:
         driver.get(url)
         WebDriverWait(driver, timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, wait_selector))
+            EC.presence_of_element_located((By.CSS_SELECTOR, css_selector))
         )
-        return BeautifulSoup(driver.page_source, "html.parser")
-    except (TimeoutException, WebDriverException) as exc:
-        log.warning("Selenium gagal untuk %s: %s", url, exc)
-        return None
+        return True
+    except TimeoutException:
+        log.warning("Timeout menunggu '%s' di %s", css_selector, url)
+        return False
+
+
+def safe_text(driver, css, default="N/A"):
+    """Ambil teks elemen, return default kalau tidak ada."""
+    try:
+        el = driver.find_element(By.CSS_SELECTOR, css)
+        return el.text.strip() or default
+    except Exception:
+        return default
+
+
+def safe_texts(driver, css):
+    """Ambil semua teks dari semua elemen yang cocok."""
+    try:
+        els = driver.find_elements(By.CSS_SELECTOR, css)
+        return [e.text.strip() for e in els if e.text.strip()]
+    except Exception:
+        return []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SCRAPER 1 — Glints (BeautifulSoup + requests)
+#  SCRAPER: LinkedIn
 # ═══════════════════════════════════════════════════════════════════════════
 
-def scrape_glints(role: str, driver=None) -> list[dict]:
-    """
-    Glints memakai SSR untuk halaman search sehingga bisa diambil
-    dengan requests + BeautifulSoup biasa.
-    URL  : https://glints.com/id/opportunities/jobs/explore
-    """
+def scrape_linkedin(driver, role):
     results = []
     keyword = role.replace(" ", "%20")
-    url = f"https://glints.com/id/opportunities/jobs/explore?keyword={keyword}&locationName=Indonesia"
-
-    log.info("[Glints] Mencari: '%s'", role)
-
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except requests.RequestException as exc:
-        log.warning("[Glints] requests gagal (%s). Mencoba Selenium...", exc)
-        if driver:
-            soup = selenium_get(driver, url, "div[data-cy='job-card']")
-        else:
-            soup = None
-
-    if not soup:
-        log.error("[Glints] Tidak bisa memuat halaman untuk '%s'.", role)
-        return results
-
-    # Kartu lowongan Glints — selector umum (bisa berubah, perlu validasi ulang)
-    cards = soup.select("div[data-cy='job-card'], div.JobCardSC__JobcardContainer, article.JobCard")
-
-    if not cards:
-        log.warning("[Glints] Tidak ada kartu ditemukan. Struktur halaman mungkin berubah.")
-        # Fallback: coba selector alternatif
-        cards = soup.find_all("div", class_=re.compile(r"JobCard|job-card", re.I))
-
-    log.info("[Glints] Ditemukan %d kartu untuk '%s'.", len(cards), role)
-
-    for card in cards:
-        try:
-            title_el   = card.select_one("h3, h2, [data-cy='job-title']")
-            company_el = card.select_one("[data-cy='company-name'], .companyName, p.company")
-            loc_el     = card.select_one("[data-cy='job-location'], .location, span.location")
-            salary_el  = card.select_one("[data-cy='salary'], .salary, span.salary")
-            type_el    = card.select_one("[data-cy='job-type'], .jobType")
-            link_el    = card.find("a", href=True)
-
-            entry = {
-                "job_title"       : title_el.get_text(strip=True)   if title_el   else role,
-                "company_name"    : company_el.get_text(strip=True) if company_el else "N/A",
-                "location"        : loc_el.get_text(strip=True)     if loc_el     else "N/A",
-                "job_type"        : type_el.get_text(strip=True)    if type_el    else "N/A",
-                "experience_level": "N/A",
-                "education_req"   : "N/A",
-                "salary_range"    : salary_el.get_text(strip=True)  if salary_el  else "Tidak Ditampilkan",
-                "job_requirements": "N/A",
-                "responsibilities": "N/A",
-                "posted_date"     : "N/A",
-                "scraped_date"    : date.today().isoformat(),
-                "source_platform" : "Glints",
-                "job_url"         : (
-                    "https://glints.com" + link_el["href"]
-                    if link_el and link_el["href"].startswith("/")
-                    else (link_el["href"] if link_el else "N/A")
-                ),
-            }
-            results.append(entry)
-        except Exception as exc:
-            log.debug("[Glints] Gagal parse kartu: %s", exc)
-
-    return results
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SCRAPER 2 — JobStreet (BeautifulSoup + requests / Selenium fallback)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def scrape_jobstreet(role: str, driver=None) -> list[dict]:
-    """
-    JobStreet Indonesia — halaman search biasanya server-rendered
-    URL : https://www.jobstreet.co.id/jobs/<keyword>
-    """
-    results = []
-    keyword = role.lower().replace(" ", "-")
-    url = f"https://www.jobstreet.co.id/jobs/{keyword}"
-
-    log.info("[JobStreet] Mencari: '%s'", role)
-
-    soup = None
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except requests.RequestException as exc:
-        log.warning("[JobStreet] requests gagal (%s). Mencoba Selenium...", exc)
-
-    # Beberapa halaman JobStreet butuh JS — pakai Selenium
-    if (not soup or not soup.select("article[data-job-id]")) and driver:
-        soup = selenium_get(driver, url, "article[data-job-id]")
-
-    if not soup:
-        log.error("[JobStreet] Tidak bisa memuat halaman untuk '%s'.", role)
-        return results
-
-    cards = soup.select("article[data-job-id], div[data-automation='jobListing']")
-
-    if not cards:
-        log.warning("[JobStreet] Tidak ada kartu ditemukan.")
-        cards = soup.find_all("article") or soup.find_all("div", {"data-automation": True})
-
-    log.info("[JobStreet] Ditemukan %d kartu untuk '%s'.", len(cards), role)
-
-    for card in cards:
-        try:
-            title_el   = card.select_one("h1, h3, [data-automation='jobTitle']")
-            company_el = card.select_one("[data-automation='jobCompany'], .company")
-            loc_el     = card.select_one("[data-automation='jobLocation'], .location")
-            salary_el  = card.select_one("[data-automation='jobSalary'], .salary")
-            date_el    = card.select_one("time, [data-automation='jobListingDate']")
-            link_el    = card.find("a", href=True)
-
-            job_url = ""
-            if link_el:
-                href = link_el["href"]
-                job_url = href if href.startswith("http") else "https://www.jobstreet.co.id" + href
-
-            entry = {
-                "job_title"       : title_el.get_text(strip=True)   if title_el   else role,
-                "company_name"    : company_el.get_text(strip=True) if company_el else "N/A",
-                "location"        : loc_el.get_text(strip=True)     if loc_el     else "N/A",
-                "job_type"        : "N/A",
-                "experience_level": "N/A",
-                "education_req"   : "N/A",
-                "salary_range"    : salary_el.get_text(strip=True)  if salary_el  else "Tidak Ditampilkan",
-                "job_requirements": "N/A",
-                "responsibilities": "N/A",
-                "posted_date"     : date_el.get_text(strip=True) if date_el else "N/A",
-                "scraped_date"    : date.today().isoformat(),
-                "source_platform" : "JobStreet",
-                "job_url"         : job_url,
-            }
-            results.append(entry)
-        except Exception as exc:
-            log.debug("[JobStreet] Gagal parse kartu: %s", exc)
-
-    return results
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  SCRAPER 3 — LinkedIn (Selenium; perlu login untuk hasil penuh)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def scrape_linkedin(role: str, driver=None) -> list[dict]:
-    """
-    LinkedIn public job search (tanpa login).
-    URL : https://www.linkedin.com/jobs/search/
-    Catatan: LinkedIn bisa memblokir request tanpa cookie. Gunakan Selenium
-             dan pertimbangkan delay antar request.
-    """
-    results = []
-
-    if not driver:
-        log.warning("[LinkedIn] Selenium diperlukan untuk LinkedIn. Dilewati.")
-        return results
-
-    keyword = role.replace(" ", "%20")
+    # Filter Indonesia, posted last 30 days
     url = (
         f"https://www.linkedin.com/jobs/search/"
-        f"?keywords={keyword}&location=Indonesia&f_TPR=r86400"
+        f"?keywords={keyword}&location=Indonesia&f_TPR=r2592000&f_WT=1%2C2%2C3"
     )
 
     log.info("[LinkedIn] Mencari: '%s'", role)
-    soup = selenium_get(driver, url, "ul.jobs-search__results-list, div.job-search-card", timeout=20)
-
-    if not soup:
-        log.error("[LinkedIn] Tidak bisa memuat halaman untuk '%s'.", role)
+    ok = wait_and_get(driver, url, "ul.jobs-search__results-list, div.job-search-card", timeout=25)
+    if not ok:
+        log.warning("[LinkedIn] Halaman tidak termuat untuk '%s'", role)
         return results
 
-    cards = soup.select("li.jobs-search__results-list-item, div.job-search-card")
-    log.info("[LinkedIn] Ditemukan %d kartu untuk '%s'.", len(cards), role)
+    time.sleep(3)  # tunggu JS selesai
+
+    # Scroll untuk load lebih banyak kartu
+    for _ in range(3):
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(1.5)
+
+    cards = driver.find_elements(By.CSS_SELECTOR,
+        "li.jobs-search__results-list-item, div.job-search-card"
+    )
+    log.info("[LinkedIn] %d kartu ditemukan untuk '%s'", len(cards), role)
 
     for card in cards:
         try:
-            title_el   = card.select_one("h3.base-search-card__title, h3")
-            company_el = card.select_one("h4.base-search-card__subtitle, h4")
-            loc_el     = card.select_one("span.job-search-card__location, .job-search-card__location")
-            date_el    = card.select_one("time")
-            link_el    = card.find("a", href=True)
+            title   = card.find_element(By.CSS_SELECTOR, "h3, .base-search-card__title").text.strip()
+            company = card.find_element(By.CSS_SELECTOR, "h4, .base-search-card__subtitle").text.strip()
+            loc     = card.find_element(By.CSS_SELECTOR, ".job-search-card__location").text.strip()
+            try:
+                posted = card.find_element(By.CSS_SELECTOR, "time").get_attribute("datetime")
+            except Exception:
+                posted = "N/A"
+            try:
+                link = card.find_element(By.CSS_SELECTOR, "a").get_attribute("href").split("?")[0]
+            except Exception:
+                link = "N/A"
 
-            entry = {
-                "job_title"       : title_el.get_text(strip=True)   if title_el   else role,
-                "company_name"    : company_el.get_text(strip=True) if company_el else "N/A",
-                "location"        : loc_el.get_text(strip=True)     if loc_el     else "N/A",
-                "job_type"        : "N/A",
-                "experience_level": "N/A",
-                "education_req"   : "N/A",
-                "salary_range"    : "Tidak Ditampilkan",
-                "job_requirements": "N/A",
-                "responsibilities": "N/A",
-                "posted_date"     : date_el.get("datetime", "N/A") if date_el else "N/A",
-                "scraped_date"    : date.today().isoformat(),
-                "source_platform" : "LinkedIn",
-                "job_url"         : link_el["href"].split("?")[0] if link_el else "N/A",
-            }
-            results.append(entry)
-        except Exception as exc:
-            log.debug("[LinkedIn] Gagal parse kartu: %s", exc)
+            results.append({
+                "job_title": title, "company_name": company, "location": loc,
+                "job_type": "N/A", "experience_level": "N/A", "education_req": "N/A",
+                "salary_range": "Tidak Ditampilkan", "job_requirements": "N/A",
+                "responsibilities": "N/A", "posted_date": posted,
+                "scraped_date": date.today().isoformat(),
+                "source_platform": "LinkedIn", "job_url": link,
+            })
+        except Exception as e:
+            log.debug("[LinkedIn] Skip kartu: %s", e)
 
     return results
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  DETAIL SCRAPER — Kunjungi URL tiap lowongan untuk data lebih lengkap
-# ═══════════════════════════════════════════════════════════════════════════
-
-def enrich_job_detail_glints(entry: dict, driver=None) -> dict:
+def enrich_linkedin(driver, entry):
     """
-    Kunjungi halaman detail Glints untuk mengambil requirements & responsibilities.
+    Kunjungi halaman detail LinkedIn untuk ambil job_type,
+    experience_level, dan job_requirements.
     """
-    if entry["job_url"] in ("N/A", ""):
+    if entry["job_url"] == "N/A":
         return entry
 
-    soup = None
     try:
-        resp = requests.get(entry["job_url"], headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception:
-        if driver:
-            soup = selenium_get(driver, entry["job_url"], "div.JobDescription")
-
-    if not soup:
-        return entry
-
-    # Glints: bagian deskripsi pekerjaan
-    desc_el = soup.select_one(
-        "div.JobDescription, div[data-cy='job-detail-description'], section.jd-section"
-    )
-    if desc_el:
-        full_text = desc_el.get_text("\n", strip=True)
-
-        # Pisahkan requirements & responsibilities dari teks bebas
-        req_match = re.search(
-            r"(requirement|kualifikasi|persyaratan)(.*?)(responsibilit|tanggung jawab|deskripsi|$)",
-            full_text, re.I | re.S
+        driver.get(entry["job_url"])
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR,
+                "div.description__text, div.show-more-less-html"
+            ))
         )
-        resp_match = re.search(
-            r"(responsibilit|tanggung jawab|job desc)(.*?)(requirement|kualifikasi|$)",
-            full_text, re.I | re.S
+        time.sleep(2)
+
+        # Klik "Show more" kalau ada
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR,
+                "button.show-more-less-html__button--more, button[aria-label='Show more']"
+            )
+            driver.execute_script("arguments[0].click();", btn)
+            time.sleep(1)
+        except Exception:
+            pass
+
+        # Kriteria pekerjaan (job type, seniority, dll)
+        criteria_items = driver.find_elements(By.CSS_SELECTOR,
+            "li.description__job-criteria-item"
         )
+        for item in criteria_items:
+            try:
+                label = item.find_element(By.CSS_SELECTOR, "h3").text.strip().lower()
+                value = item.find_element(By.CSS_SELECTOR, "span").text.strip()
+                if "employment" in label or "type" in label or "jenis" in label:
+                    entry["job_type"] = value
+                elif "seniority" in label or "level" in label or "pengalaman" in label:
+                    entry["experience_level"] = value
+                elif "education" in label or "pendidikan" in label:
+                    entry["education_req"] = value
+            except Exception:
+                pass
 
-        if req_match:
-            entry["job_requirements"] = req_match.group(2).strip()[:500]
-        if resp_match:
-            entry["responsibilities"] = resp_match.group(2).strip()[:500]
+        # Deskripsi / requirements
+        try:
+            desc_el = driver.find_element(By.CSS_SELECTOR,
+                "div.show-more-less-html__markup, div.description__text"
+            )
+            full_text = desc_el.text.strip()
 
-    # Experience & education
-    exp_el = soup.select_one("[data-cy='experience'], .experience, span.exp")
-    edu_el = soup.select_one("[data-cy='education'], .education, span.edu")
-    type_el = soup.select_one("[data-cy='job-type'], .jobType")
+            # Pisah requirements dari full deskripsi
+            req_match = re.search(
+                r"(qualif|requirement|kualif|persyaratan|skill)(.*?)"
+                r"(responsib|tanggung|benefit|about|tentang|$)",
+                full_text, re.I | re.S
+            )
+            resp_match = re.search(
+                r"(responsib|tanggung jawab|job desc|deskripsi pekerjaan)(.*?)"
+                r"(qualif|requirement|kualif|benefit|$)",
+                full_text, re.I | re.S
+            )
 
-    if exp_el:
-        entry["experience_level"] = exp_el.get_text(strip=True)
-    if edu_el:
-        entry["education_req"] = edu_el.get_text(strip=True)
-    if type_el:
-        entry["job_type"] = type_el.get_text(strip=True)
+            if req_match:
+                entry["job_requirements"] = req_match.group(2).strip()[:600]
+            elif full_text:
+                # Kalau tidak ada section khusus, ambil 400 karakter pertama
+                entry["job_requirements"] = full_text[:400]
+
+            if resp_match:
+                entry["responsibilities"] = resp_match.group(2).strip()[:600]
+
+        except Exception:
+            pass
+
+        # Gaji (kadang muncul di detail)
+        try:
+            salary = driver.find_element(By.CSS_SELECTOR,
+                ".compensation__salary, .salary"
+            ).text.strip()
+            if salary:
+                entry["salary_range"] = salary
+        except Exception:
+            pass
+
+    except Exception as e:
+        log.debug("[LinkedIn] Gagal enrich %s: %s", entry["job_url"], e)
 
     return entry
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MAIN PIPELINE
+#  SCRAPER: Glints
+# ═══════════════════════════════════════════════════════════════════════════
+
+def scrape_glints(driver, role):
+    results = []
+    keyword = role.replace(" ", "%20")
+    url = (
+        f"https://glints.com/id/opportunities/jobs/explore"
+        f"?keyword={keyword}&locationName=Indonesia&country=ID"
+    )
+
+    log.info("[Glints] Mencari: '%s'", role)
+
+    try:
+        driver.get(url)
+        # Tunggu salah satu selector yang mungkin muncul
+        WebDriverWait(driver, 25).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR,
+                "div[class*='JobCardSC'], div[class*='CompactOpportunityCard'], "
+                "div[class*='GlintsContainer'] a[href*='/opportunities/jobs']"
+            ))
+        )
+        time.sleep(3)
+        for _ in range(3):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1.5)
+    except TimeoutException:
+        log.warning("[Glints] Timeout untuk '%s'", role)
+        return results
+
+    # Coba beberapa selector kartu
+    cards = driver.find_elements(By.CSS_SELECTOR,
+        "div[class*='JobCardSC__JobcardContainer'], "
+        "div[class*='CompactOpportunityCard'], "
+        "div[class*='JobCard']"
+    )
+
+    # Fallback: ambil semua link lowongan
+    if not cards:
+        log.warning("[Glints] Selector kartu tidak cocok, coba fallback link...")
+        links = driver.find_elements(By.CSS_SELECTOR,
+            "a[href*='/opportunities/jobs/']"
+        )
+        log.info("[Glints] %d link ditemukan (fallback)", len(links))
+        for link_el in links[:15]:
+            try:
+                href = link_el.get_attribute("href")
+                title_el = link_el.find_elements(By.CSS_SELECTOR, "h2, h3, span[class*='title']")
+                title = title_el[0].text.strip() if title_el else role
+                if not title or len(title) < 3:
+                    continue
+                results.append({
+                    "job_title": title, "company_name": "N/A", "location": "N/A",
+                    "job_type": "N/A", "experience_level": "N/A", "education_req": "N/A",
+                    "salary_range": "N/A", "job_requirements": "N/A",
+                    "responsibilities": "N/A", "posted_date": "N/A",
+                    "scraped_date": date.today().isoformat(),
+                    "source_platform": "Glints", "job_url": href,
+                })
+            except Exception:
+                pass
+        return results
+
+    log.info("[Glints] %d kartu ditemukan untuk '%s'", len(cards), role)
+
+    for card in cards:
+        try:
+            title_el   = card.find_elements(By.CSS_SELECTOR, "h2, h3, [class*='Title']")
+            company_el = card.find_elements(By.CSS_SELECTOR, "[class*='company'], [class*='Company']")
+            loc_el     = card.find_elements(By.CSS_SELECTOR, "[class*='location'], [class*='Location']")
+            salary_el  = card.find_elements(By.CSS_SELECTOR, "[class*='salary'], [class*='Salary']")
+            link_el    = card.find_elements(By.CSS_SELECTOR, "a[href]")
+
+            title   = title_el[0].text.strip()   if title_el   else role
+            company = company_el[0].text.strip()  if company_el else "N/A"
+            loc     = loc_el[0].text.strip()      if loc_el     else "N/A"
+            salary  = salary_el[0].text.strip()   if salary_el  else "Tidak Ditampilkan"
+            href    = link_el[0].get_attribute("href") if link_el else "N/A"
+
+            if not title or len(title) < 3:
+                continue
+
+            results.append({
+                "job_title": title, "company_name": company, "location": loc,
+                "job_type": "N/A", "experience_level": "N/A", "education_req": "N/A",
+                "salary_range": salary, "job_requirements": "N/A",
+                "responsibilities": "N/A", "posted_date": "N/A",
+                "scraped_date": date.today().isoformat(),
+                "source_platform": "Glints", "job_url": href,
+            })
+        except Exception as e:
+            log.debug("[Glints] Skip kartu: %s", e)
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SCRAPER: JobStreet
+# ═══════════════════════════════════════════════════════════════════════════
+
+def scrape_jobstreet(driver, role):
+    results = []
+    keyword = role.replace(" ", "-").lower()
+    url = f"https://www.jobstreet.co.id/jobs/{keyword}-jobs"
+
+    log.info("[JobStreet] Mencari: '%s'", role)
+
+    try:
+        driver.get(url)
+        WebDriverWait(driver, 25).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR,
+                "article[data-job-id], div[data-automation='jobListing'], "
+                "div[data-testid='job-card']"
+            ))
+        )
+        time.sleep(3)
+        for _ in range(3):
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1.5)
+    except TimeoutException:
+        log.warning("[JobStreet] Timeout untuk '%s'", role)
+        return results
+
+    cards = driver.find_elements(By.CSS_SELECTOR,
+        "article[data-job-id], div[data-automation='jobListing'], div[data-testid='job-card']"
+    )
+    log.info("[JobStreet] %d kartu ditemukan untuk '%s'", len(cards), role)
+
+    for card in cards:
+        try:
+            title_el   = card.find_elements(By.CSS_SELECTOR,
+                "h1, h3, [data-automation='jobTitle'], [data-testid='job-title']")
+            company_el = card.find_elements(By.CSS_SELECTOR,
+                "[data-automation='jobCompany'], [data-testid='company-name'], .company")
+            loc_el     = card.find_elements(By.CSS_SELECTOR,
+                "[data-automation='jobLocation'], [data-testid='job-location'], .location")
+            salary_el  = card.find_elements(By.CSS_SELECTOR,
+                "[data-automation='jobSalary'], [data-testid='job-salary']")
+            date_el    = card.find_elements(By.CSS_SELECTOR, "time, [data-automation='jobListingDate']")
+            link_el    = card.find_elements(By.CSS_SELECTOR, "a[href]")
+
+            title   = title_el[0].text.strip()   if title_el   else role
+            company = company_el[0].text.strip()  if company_el else "N/A"
+            loc     = loc_el[0].text.strip()      if loc_el     else "N/A"
+            salary  = salary_el[0].text.strip()   if salary_el  else "Tidak Ditampilkan"
+            posted  = date_el[0].text.strip()     if date_el    else "N/A"
+
+            href = "N/A"
+            if link_el:
+                href = link_el[0].get_attribute("href")
+                if href and not href.startswith("http"):
+                    href = "https://www.jobstreet.co.id" + href
+
+            if not title or len(title) < 3:
+                continue
+
+            results.append({
+                "job_title": title, "company_name": company, "location": loc,
+                "job_type": "N/A", "experience_level": "N/A", "education_req": "N/A",
+                "salary_range": salary, "job_requirements": "N/A",
+                "responsibilities": "N/A", "posted_date": posted,
+                "scraped_date": date.today().isoformat(),
+                "source_platform": "JobStreet", "job_url": href,
+            })
+        except Exception as e:
+            log.debug("[JobStreet] Skip kartu: %s", e)
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 
 def main():
     log.info("=" * 60)
-    log.info("  Mulai Scraping Lowongan Kerja")
-    log.info("  Tanggal: %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    log.info("  Scraping Lowongan Kerja — %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     log.info("=" * 60)
 
-    # Inisialisasi Selenium (opsional)
-    driver = build_selenium_driver()
-    if driver:
-        log.info("Selenium Chrome driver berhasil dibuat.")
-    else:
-        log.info("Berjalan tanpa Selenium (hanya BeautifulSoup).")
+    driver = build_driver()
+    all_results = []
 
-    all_results: list[dict] = []
+    try:
+        for role in TARGET_ROLES:
+            log.info("\n▶ Role: %s", role)
 
-    for role in TARGET_ROLES:
-        log.info("\n── Role: %s ──", role)
+            # LinkedIn — enrich 5 entri pertama
+            li_data = scrape_linkedin(driver, role)
+            for i, entry in enumerate(li_data[:5]):
+                log.info("  Enrich LinkedIn %d/%d: %s", i+1, min(5, len(li_data)), entry["job_title"])
+                li_data[i] = enrich_linkedin(driver, entry)
+                time.sleep(2)
+            all_results.extend(li_data)
+            time.sleep(3)
 
-        # ── Glints ──────────────────────────────────────────────────────
-        glints_data = scrape_glints(role, driver)
-        log.info("[Glints] %d lowongan ditemukan.", len(glints_data))
+            # Glints
+            glints_data = scrape_glints(driver, role)
+            all_results.extend(glints_data)
+            time.sleep(3)
 
-        # Enrich detail untuk 3 entry pertama (hemat waktu & bandwidth)
-        enriched = []
-        for i, entry in enumerate(glints_data[:3]):
-            log.info("  Enriching Glints entry %d/%d: %s", i+1, min(3, len(glints_data)), entry["job_title"])
-            enriched.append(enrich_job_detail_glints(entry, driver))
-            time.sleep(1.5)  # jeda sopan
-        all_results.extend(enriched + glints_data[3:])
+            # JobStreet
+            js_data = scrape_jobstreet(driver, role)
+            all_results.extend(js_data)
+            time.sleep(3)
 
-        time.sleep(2)
-
-        # ── JobStreet ────────────────────────────────────────────────────
-        js_data = scrape_jobstreet(role, driver)
-        log.info("[JobStreet] %d lowongan ditemukan.", len(js_data))
-        all_results.extend(js_data)
-
-        time.sleep(2)
-
-        # ── LinkedIn ─────────────────────────────────────────────────────
-        li_data = scrape_linkedin(role, driver)
-        log.info("[LinkedIn] %d lowongan ditemukan.", len(li_data))
-        all_results.extend(li_data)
-
-        time.sleep(3)
-
-    # ── Tutup driver ─────────────────────────────────────────────────────
-    if driver:
+    finally:
         driver.quit()
-        log.info("Selenium driver ditutup.")
+        log.info("Driver ditutup.")
 
-    # ── Simpan output ─────────────────────────────────────────────────────
     if not all_results:
-        log.error("Tidak ada data yang berhasil dikumpulkan. Cek koneksi atau selector.")
+        log.error("Tidak ada data yang berhasil dikumpulkan.")
         return
 
     df = pd.DataFrame(all_results, columns=COLUMNS)
 
-    # Bersihkan whitespace berlebih
+    # Bersihkan
     for col in df.select_dtypes(include="object").columns:
         df[col] = df[col].str.strip()
 
-    # Hapus duplikat (job_title + company_name + source)
+    # Hapus baris tanpa judul valid
+    df = df[df["job_title"].str.len() > 3]
+
+    # Deduplikasi
     before = len(df)
     df.drop_duplicates(subset=["job_title", "company_name", "source_platform"], inplace=True)
-    log.info("Duplikat dihapus: %d → %d baris.", before, len(df))
+    df.reset_index(drop=True, inplace=True)
+    log.info("Duplikat dihapus: %d → %d baris", before, len(df))
 
-    # Simpan CSV
+    # Simpan
     df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-    log.info("CSV tersimpan → %s", OUTPUT_CSV)
-
-    # Simpan JSON
     df.to_json(OUTPUT_JSON, orient="records", force_ascii=False, indent=2)
-    log.info("JSON tersimpan → %s", OUTPUT_JSON)
 
-    # ── Ringkasan ────────────────────────────────────────────────────────
+    # Ringkasan
     log.info("\n%s", "=" * 60)
-    log.info("RINGKASAN RAW DATASET")
-    log.info("Total lowongan  : %d", len(df))
-    log.info("Per platform    :")
-    for platform, count in df["source_platform"].value_counts().items():
-        log.info("  %-12s: %d", platform, count)
-    log.info("Per role        :")
-    # Cocokkan job_title ke TARGET_ROLES
-    for role in TARGET_ROLES:
-        n = df["job_title"].str.contains(role.split()[0], case=False, na=False).sum()
-        log.info("  %-30s: %d", role, n)
-    log.info("Output CSV  → %s", OUTPUT_CSV.resolve())
-    log.info("Output JSON → %s", OUTPUT_JSON.resolve())
+    log.info("RINGKASAN")
+    log.info("Total : %d lowongan", len(df))
+    for platform, n in df["source_platform"].value_counts().items():
+        log.info("  %-12s: %d", platform, n)
+    log.info("Output → %s", OUTPUT_CSV.resolve())
     log.info("=" * 60)
 
 
