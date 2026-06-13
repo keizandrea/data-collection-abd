@@ -115,6 +115,24 @@ def safe_texts(driver, css):
         return []
 
 
+def clean_text(text, max_len=None):
+    """
+    Normalisasi teks agar CSV tetap bersih:
+    - Ganti newline/tab dengan spasi
+    - Collapse multiple whitespace
+    - Strip ujung-ujungnya
+    - Potong kalau ada max_len
+    """
+    if not text or text == "N/A":
+        return text or "N/A"
+    text = re.sub(r"[\r\n\t]+", " ", text)   # newline & tab → spasi
+    text = re.sub(r" {2,}", " ", text)         # spasi ganda → satu
+    text = text.strip()
+    if max_len and len(text) > max_len:
+        text = text[:max_len].rstrip()
+    return text or "N/A"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  SCRAPER: LinkedIn
 # ═══════════════════════════════════════════════════════════════════════════
@@ -148,9 +166,9 @@ def scrape_linkedin(driver, role):
 
     for card in cards:
         try:
-            title   = card.find_element(By.CSS_SELECTOR, "h3, .base-search-card__title").text.strip()
-            company = card.find_element(By.CSS_SELECTOR, "h4, .base-search-card__subtitle").text.strip()
-            loc     = card.find_element(By.CSS_SELECTOR, ".job-search-card__location").text.strip()
+            title   = clean_text(card.find_element(By.CSS_SELECTOR, "h3, .base-search-card__title").text)
+            company = clean_text(card.find_element(By.CSS_SELECTOR, "h4, .base-search-card__subtitle").text)
+            loc     = clean_text(card.find_element(By.CSS_SELECTOR, ".job-search-card__location").text)
             try:
                 posted = card.find_element(By.CSS_SELECTOR, "time").get_attribute("datetime")
             except Exception:
@@ -238,13 +256,13 @@ def enrich_linkedin(driver, entry):
             )
 
             if req_match:
-                entry["job_requirements"] = req_match.group(2).strip()[:600]
+                entry["job_requirements"] = clean_text(req_match.group(2), max_len=600)
             elif full_text:
                 # Kalau tidak ada section khusus, ambil 400 karakter pertama
-                entry["job_requirements"] = full_text[:400]
+                entry["job_requirements"] = clean_text(full_text, max_len=400)
 
             if resp_match:
-                entry["responsibilities"] = resp_match.group(2).strip()[:600]
+                entry["responsibilities"] = clean_text(resp_match.group(2), max_len=600)
 
         except Exception:
             pass
@@ -339,10 +357,10 @@ def scrape_glints(driver, role):
             salary_el  = card.find_elements(By.CSS_SELECTOR, "[class*='salary'], [class*='Salary']")
             link_el    = card.find_elements(By.CSS_SELECTOR, "a[href]")
 
-            title   = title_el[0].text.strip()   if title_el   else role
-            company = company_el[0].text.strip()  if company_el else "N/A"
-            loc     = loc_el[0].text.strip()      if loc_el     else "N/A"
-            salary  = salary_el[0].text.strip()   if salary_el  else "Tidak Ditampilkan"
+            title   = clean_text(title_el[0].text)   if title_el   else role
+            company = clean_text(company_el[0].text)  if company_el else "N/A"
+            loc     = clean_text(loc_el[0].text)      if loc_el     else "N/A"
+            salary  = clean_text(salary_el[0].text)   if salary_el  else "Tidak Ditampilkan"
             href    = link_el[0].get_attribute("href") if link_el else "N/A"
 
             if not title or len(title) < 3:
@@ -407,11 +425,11 @@ def scrape_jobstreet(driver, role):
             date_el    = card.find_elements(By.CSS_SELECTOR, "time, [data-automation='jobListingDate']")
             link_el    = card.find_elements(By.CSS_SELECTOR, "a[href]")
 
-            title   = title_el[0].text.strip()   if title_el   else role
-            company = company_el[0].text.strip()  if company_el else "N/A"
-            loc     = loc_el[0].text.strip()      if loc_el     else "N/A"
-            salary  = salary_el[0].text.strip()   if salary_el  else "Tidak Ditampilkan"
-            posted  = date_el[0].text.strip()     if date_el    else "N/A"
+            title   = clean_text(title_el[0].text)   if title_el   else role
+            company = clean_text(company_el[0].text)  if company_el else "N/A"
+            loc     = clean_text(loc_el[0].text)      if loc_el     else "N/A"
+            salary  = clean_text(salary_el[0].text)   if salary_el  else "Tidak Ditampilkan"
+            posted  = clean_text(date_el[0].text)     if date_el    else "N/A"
 
             href = "N/A"
             if link_el:
@@ -481,21 +499,26 @@ def main():
 
     df = pd.DataFrame(all_results, columns=COLUMNS)
 
-    # Bersihkan
+    # Bersihkan — normalisasi whitespace semua kolom string
     for col in df.select_dtypes(include="object").columns:
-        df[col] = df[col].str.strip()
+        df[col] = df[col].apply(lambda x: clean_text(x) if isinstance(x, str) else x)
 
     # Hapus baris tanpa judul valid
     df = df[df["job_title"].str.len() > 3]
 
-    # Deduplikasi
+    # Deduplikasi — pakai job_url sebagai tiebreaker utama, fallback ke title+company+platform
     before = len(df)
-    df.drop_duplicates(subset=["job_title", "company_name", "source_platform"], inplace=True)
+    df_with_url = df[df["job_url"] != "N/A"].drop_duplicates(subset=["job_url"])
+    df_no_url   = df[df["job_url"] == "N/A"].drop_duplicates(
+        subset=["job_title", "company_name", "source_platform"]
+    )
+    df = pd.concat([df_with_url, df_no_url], ignore_index=True)
     df.reset_index(drop=True, inplace=True)
     log.info("Duplikat dihapus: %d → %d baris", before, len(df))
 
-    # Simpan
-    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
+    # Simpan — quoting=QUOTE_ALL agar cell multiword/spesial aman di Excel/spreadsheet
+    df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig",
+              quoting=1)  # csv.QUOTE_ALL
     df.to_json(OUTPUT_JSON, orient="records", force_ascii=False, indent=2)
 
     # Ringkasan
